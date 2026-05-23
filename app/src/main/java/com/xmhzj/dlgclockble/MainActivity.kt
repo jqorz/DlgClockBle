@@ -2,7 +2,6 @@ package com.xmhzj.dlgclockble
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -11,11 +10,6 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
-import android.content.DialogInterface
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -28,6 +22,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.widget.Button
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -40,7 +35,6 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Arrays
 import java.util.Calendar
-import java.util.Collections
 import java.util.Timer
 import java.util.TimerTask
 import java.util.UUID
@@ -64,14 +58,11 @@ class MainActivity : AppCompatActivity() {
     private var updateProgressBar: LinearLayout? = null
     private var updateProgressText: TextView? = null
     private var logWindow: TextView? = null
-    private var connectButton: Button? = null
     private var setimeButton: Button? = null
     private var upfirmButton: Button? = null
     private var send90Button: Button? = null
     private var calibrationButton: Button? = null
     private var clearLogButton: Button? = null
-    private var scanDevicesButton: Button? = null
-    private val scannedDevices: MutableList<BluetoothDevice> = Collections.synchronizedList<BluetoothDevice?>(ArrayList<BluetoothDevice?>())
     private val deviceTimeLock = Any()
     private var currentDeviceName = ""
     private var lastSyncTimestamp: Long = 0
@@ -126,7 +117,19 @@ class MainActivity : AppCompatActivity() {
         setupBluetooth()
         updateSystemTime()
         startSystemTimeUpdate()
-        addLog("终端已启动，等待设备连接...")
+
+        // 获取从设备选择界面传递的设备信息
+        val deviceAddress = intent.getStringExtra("device_address")
+        val deviceName = intent.getStringExtra("device_name")
+
+        if (deviceAddress != null && deviceName != null) {
+            addLog("正在连接设备: $deviceName")
+            connectToSelectedDevice(deviceAddress, deviceName)
+        } else {
+            addLog("错误: 未指定设备")
+            Toast.makeText(this, "未指定设备", Toast.LENGTH_SHORT).show()
+            finish()
+        }
     }
 
     private fun initUI() {
@@ -138,39 +141,35 @@ class MainActivity : AppCompatActivity() {
         updateProgressBar = findViewById<LinearLayout>(R.id.update_progress_bar)
         updateProgressText = findViewById<TextView>(R.id.update_progress_text)
         logWindow = findViewById<TextView>(R.id.log_window)
-        connectButton = findViewById<Button>(R.id.connect_button)
         setimeButton = findViewById<Button>(R.id.setime_button)
         upfirmButton = findViewById<Button>(R.id.upfirm_button)
         send90Button = findViewById<Button>(R.id.send90_button)
         calibrationButton = findViewById<Button>(R.id.calibration_button)
         clearLogButton = findViewById<Button>(R.id.clear_log_btn)
-        scanDevicesButton = findViewById<Button>(R.id.scan_devices_button)
-
-        connectButton!!.setOnClickListener(View.OnClickListener { v: View? ->
-            if (isConnected) {
-                disconnectDevice()
-            } else {
-                connectToDevice()
-            }
-        })
 
         setimeButton!!.setOnClickListener(View.OnClickListener { v: View? -> onSetTime() })
         upfirmButton!!.setOnClickListener(View.OnClickListener { v: View? -> onUpdate() })
         send90Button!!.setOnClickListener(View.OnClickListener { v: View? -> onSend90() })
         calibrationButton!!.setOnClickListener(View.OnClickListener { v: View? -> onCalibration() })
         clearLogButton!!.setOnClickListener(View.OnClickListener { v: View? -> clearLog() })
-        scanDevicesButton!!.setOnClickListener(View.OnClickListener { v: View? -> scanDevices() })
+
+        findViewById<ImageButton>(R.id.close_button).setOnClickListener {
+            disconnectAndFinish()
+        }
     }
 
     private val gattCallback: BluetoothGattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            Log.d(TAG, "onConnectionStateChange status=0x${status.toString(16)} newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 isConnected = true
+                addLog("已连接 (status=0x${status.toString(16)})")
                 updateUIState("正在获取服务...", false, false)
-                // 请求更短的连接间隔以提高响应速度
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.w(TAG, "BLE DISCONNECTED status=0x${status.toString(16)}")
+                addLog("BLE断开! status=0x${status.toString(16)}")
                 doDisconnectDevice()
             }
         }
@@ -196,7 +195,7 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     if (longValueChar != null) {
-                        longValueChar!!.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                        longValueChar!!.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
                         gatt.setCharacteristicNotification(longValueChar, true)
                         val longDescriptor = longValueChar!!.getDescriptor(
                             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -229,6 +228,13 @@ class MainActivity : AppCompatActivity() {
                     })
                     addLog("当前电压: " + String.format("%.2f V", voltageValue))
                 } else if (characteristic.getUuid().toString() == LONG_VALUE_UUID) {
+                    // 打印原始数据用于调试
+                    val hexStr = StringBuilder()
+                    for (b in value) {
+                        hexStr.append(String.format("%02X ", b.toInt() and 0xFF))
+                    }
+                    Log.d(TAG, "LONG_VALUE raw [${value.size}B]: $hexStr")
+
                     synchronized(deviceTimeLock) {
                         deviceTimeYear = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getShort(0).toInt()
                         deviceTimeMonth = value[2].toInt()
@@ -237,6 +243,9 @@ class MainActivity : AppCompatActivity() {
                         deviceTimeMinute = value[5].toInt()
                         deviceTimeSecond = value[6].toInt()
                         deviceTimeBaseTimestamp = System.currentTimeMillis()
+                        Log.d(TAG, String.format("Parsed time: %d-%02d-%02d %02d:%02d:%02d",
+                            deviceTimeYear, deviceTimeMonth + 1, deviceTimeDay,
+                            deviceTimeHour, deviceTimeMinute, deviceTimeSecond))
                     }
 
                     startDeviceTimeUpdate()
@@ -257,10 +266,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?, status: Int) {
+            val uuid = characteristic?.uuid?.toString() ?: "unknown"
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                addLog("数据写入成功")
+                Log.d(TAG, "onCharacteristicWrite SUCCESS uuid=$uuid")
+                addLog("写入成功: $uuid")
             } else {
-                addLog("数据写入失败: " + status.toString(16))
+                Log.e(TAG, "onCharacteristicWrite FAILED uuid=$uuid status=0x${status.toString(16)}")
+                addLog("写入失败: uuid=$uuid status=0x${status.toString(16)}")
             }
         }
 
@@ -275,8 +287,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateUIState(connectButtonText: String?, canConnect: Boolean, functionsEnabled: Boolean) {
         mainHandler.post(Runnable {
-            connectButton!!.setText(connectButtonText)
-            connectButton!!.setEnabled(canConnect)
             setimeButton!!.setEnabled(functionsEnabled)
             upfirmButton!!.setEnabled(functionsEnabled)
             send90Button!!.setEnabled(functionsEnabled)
@@ -284,37 +294,22 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun connectToDevice() {
+    private fun connectToSelectedDevice(deviceAddress: String, deviceName: String) {
         updateUIState("连接中...", false, false)
-        addLog("请求设备...")
+        addLog("正在连接设备: $deviceName ($deviceAddress)")
 
-        // 启动蓝牙设备扫描
-        val scanner = bluetoothAdapter!!.getBluetoothLeScanner()
-        if (scanner != null) {
-            val filters: MutableList<ScanFilter?> = ArrayList<ScanFilter?>()
-            val filter = ScanFilter.Builder().build()
-            filters.add(filter)
-            scanner.startScan(
-                filters,
-                ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                    .build(),
-                object : ScanCallback() {
-                    override fun onScanResult(callbackType: Int, result: ScanResult) {
-                        val device = result.getDevice()
-                        val deviceName = device.getName()
-                        if (deviceName != null && deviceName.startsWith("DLG-CLOCK")) {
-                            addLog("设备名称: " + deviceName)
-                            deviceNameTextView!!.setText(deviceName)
-                            bluetoothGatt = device.connectGatt(this@MainActivity, false, gattCallback)
-                            scanner.stopScan(this)
-                        }
-                    }
-                })
+        deviceNameTextView?.text = deviceName
+        currentDeviceName = deviceName
+
+        val device = bluetoothAdapter?.getRemoteDevice(deviceAddress)
+        if (device != null) {
+            bluetoothGatt = device.connectGatt(this, false, gattCallback)
+        } else {
+            addLog("错误: 无法获取设备")
+            Toast.makeText(this, "无法获取设备", Toast.LENGTH_SHORT).show()
+            finish()
         }
     }
-
-    private var scanCallback: ScanCallback? = null
 
     private fun addLog(msg: String) {
         if (destroyed) return
@@ -359,11 +354,16 @@ class MainActivity : AppCompatActivity() {
 
         isConnected = false
         currentDeviceName = ""
-        deviceNameTextView!!.setText("未连接")
-        currentVoltageTextView!!.setText("--.- V")
-        currentTimeTextView!!.setText("--:--:--")
-        updateUIState("连接设备", true, false)
         addLog("设备已断开连接")
+
+        // 返回设备选择界面
+        mainHandler.post {
+            Toast.makeText(this, "设备已断开连接", Toast.LENGTH_SHORT).show()
+            val intent = Intent(this, DeviceSelectionActivity::class.java)
+            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            startActivity(intent)
+            finish()
+        }
     }
 
     private fun startDeviceTimeUpdate() {
@@ -476,7 +476,7 @@ class MainActivity : AppCompatActivity() {
                 val second = now.get(Calendar.SECOND)
                 val wday = now.get(Calendar.DAY_OF_WEEK) - 1  // Calendar: 1=Sun, protocol: 0=Sun
 
-                addLog(String.format("当前时间: %d-%02d-%02d %02d:%02d:%02d", year, month + 1, day, hour, minute, second))
+                addLog(String.format("准备同步: %d-%02d-%02d %02d:%02d:%02d wday=%d", year, month + 1, day, hour, minute, second, wday))
 
                 val buf = ByteArray(12)
                 buf[0] = 0x91.toByte()
@@ -500,8 +500,8 @@ class MainActivity : AppCompatActivity() {
                 }
                 buf[11] = lunarDay.day.toByte()  // 农历日期: 1-30
 
-                addLog("正在写入时间数据... ")
-
+                addLog(String.format("写入数据: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]))
 
                 // 在主线程执行写入操作
                 mainHandler.post(Runnable {
@@ -510,6 +510,18 @@ class MainActivity : AppCompatActivity() {
 
                 // 等待写入完成
                 Thread.sleep(500)
+
+                // 读取设备时间验证同步结果
+                mainHandler.post(Runnable {
+                    bluetoothGatt?.readCharacteristic(longValueChar)
+                })
+                Thread.sleep(300)
+
+                synchronized(deviceTimeLock) {
+                    addLog(String.format("设备回传时间: %d-%02d-%02d %02d:%02d:%02d",
+                        deviceTimeYear, deviceTimeMonth + 1, deviceTimeDay,
+                        deviceTimeHour, deviceTimeMinute, deviceTimeSecond))
+                }
 
                 // 更新设备时间基准值
                 synchronized(deviceTimeLock) {
@@ -527,7 +539,7 @@ class MainActivity : AppCompatActivity() {
                 getSharedPreferences("calibration", MODE_PRIVATE).edit()
                     .putLong("last_sync_timestamp", lastSyncTimestamp)
                     .apply()
-                addLog("同步时间成功!")
+                addLog("同步时间完成!")
             } catch (e: Exception) {
                 addLog("同步时间失败: " + e.message)
                 e.printStackTrace()
@@ -768,103 +780,6 @@ class MainActivity : AppCompatActivity() {
         }).start()
     }
 
-    private fun scanDevices() {
-        scannedDevices.clear()
-        addLog("开始扫描设备...")
-
-        if (bluetoothAdapter == null) {
-            addLog("错误: 蓝牙适配器为空")
-            return
-        }
-
-        val scanner = bluetoothAdapter!!.getBluetoothLeScanner()
-        if (scanner != null) {
-            // 创建扫描回调
-            scanCallback = object : ScanCallback() {
-                override fun onScanResult(callbackType: Int, result: ScanResult) {
-                    val device = result.getDevice()
-                    val deviceName = device.getName()
-                    if (deviceName != null && !deviceName.isEmpty() && !scannedDevices.contains(device)) {
-                        scannedDevices.add(device)
-                    }
-                }
-            }
-
-            val filters: MutableList<ScanFilter?> = ArrayList<ScanFilter?>()
-            val filter = ScanFilter.Builder().build()
-            filters.add(filter)
-            scanner.startScan(
-                filters,
-                ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                    .build(),
-                scanCallback
-            )
-
-            mainHandler.postDelayed(Runnable {
-                if (scanCallback != null) {
-                    scanner.stopScan(scanCallback)
-                    scanCallback = null
-                }
-                val count = scannedDevices.size
-                addLog("扫描完成，共发现 " + count + " 个设备")
-                showDeviceList()
-            }, 5000)
-        }
-    }
-
-    private fun showDeviceList() {
-        if (scannedDevices.isEmpty()) {
-            Toast.makeText(this, "未发现任何设备", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val sortedDevices: MutableList<BluetoothDevice> = ArrayList<BluetoothDevice>()
-        val nrfDevices: MutableList<BluetoothDevice> = ArrayList<BluetoothDevice>()
-        val otherDevices: MutableList<BluetoothDevice> = ArrayList<BluetoothDevice>()
-
-        for (device in scannedDevices) {
-            val name = device.getName()
-            if (name != null && (name.startsWith("NRF") || name.startsWith("DLG"))) {
-                nrfDevices.add(device)
-            } else {
-                otherDevices.add(device)
-            }
-        }
-
-        sortedDevices.addAll(nrfDevices)
-        sortedDevices.addAll(otherDevices)
-
-        val builder = AlertDialog.Builder(this)
-        builder.setTitle("选择设备")
-
-        val deviceNames = arrayOfNulls<String>(sortedDevices.size)
-        for (i in sortedDevices.indices) {
-            val device = sortedDevices.get(i)
-            val name = device.getName()
-            deviceNames[i] = name + " (" + device.getAddress() + ")"
-        }
-
-        val finalSortedDevices = sortedDevices
-        builder.setItems(deviceNames, DialogInterface.OnClickListener { dialog: DialogInterface?, which: Int ->
-            val selectedDevice = finalSortedDevices.get(which)
-            connectToSelectedDevice(selectedDevice)
-        })
-
-        builder.setNegativeButton("取消", null)
-        builder.show()
-    }
-
-    private fun connectToSelectedDevice(device: BluetoothDevice) {
-        updateUIState("连接中...", false, false)
-        addLog("连接设备: " + device.getName() + " (" + device.getAddress() + ")")
-
-        if (device.getName() != null) {
-            deviceNameTextView!!.setText(device.getName())
-        }
-
-        bluetoothGatt = device.connectGatt(this@MainActivity, false, gattCallback)
-    }
 
     private fun writeCharacteristic(characteristic: BluetoothGattCharacteristic?, data: ByteArray) {
         if (characteristic == null || bluetoothGatt == null) {
@@ -879,9 +794,11 @@ class MainActivity : AppCompatActivity() {
         addLog("发送数据 [" + data.size + " bytes]: " + hexStr.toString().trim { it <= ' ' })
         synchronized(gattLock) {
             try {
-                characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                // 使用 WRITE_TYPE_NO_RESPONSE 避免等待设备回复导致超时断连
+                // 设备端EPD刷新耗时长，无法及时回复 Write Response
+                characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    bluetoothGatt!!.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                    bluetoothGatt!!.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
                 } else {
                     characteristic.setValue(data)
                     bluetoothGatt!!.writeCharacteristic(characteristic)
@@ -933,6 +850,24 @@ class MainActivity : AppCompatActivity() {
             addLog("提示: 蓝牙未开启")
             Toast.makeText(this, "请开启蓝牙", Toast.LENGTH_LONG).show()
         }
+    }
+
+    private fun disconnectAndFinish() {
+        deviceTimeTimer?.cancel()
+        deviceTimeTimer = null
+        systemTimeTimer?.cancel()
+        systemTimeTimer = null
+
+        synchronized(gattLock) {
+            bluetoothGatt?.disconnect()
+            bluetoothGatt?.close()
+            bluetoothGatt = null
+        }
+
+        val intent = Intent(this, DeviceSelectionActivity::class.java)
+        intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        startActivity(intent)
+        finish()
     }
 
     override fun onDestroy() {

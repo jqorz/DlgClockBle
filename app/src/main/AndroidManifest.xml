@@ -13,19 +13,26 @@
         android:allowBackup="true"
         android:label="价签时钟对时"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
-        
+
         <activity
-            android:name=".MainActivity"
+            android:name=".DeviceSelectionActivity"
             android:icon="@mipmap/ic_launcher"
             android:exported="true"
-            android:launchMode="singleInstance"
-            android:taskAffinity="com.xmhzj.dlgclockble.main">
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        
+
+        <activity
+            android:name=".MainActivity"
+            android:icon="@mipmap/ic_launcher"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:taskAffinity="com.xmhzj.dlgclockble.main">
+        </activity>
+
         <activity
             android:name=".MainActivityOld"
             android:label="价签时钟对时(旧版)"
@@ -38,6 +45,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        
+
     </application>
 </manifest>
