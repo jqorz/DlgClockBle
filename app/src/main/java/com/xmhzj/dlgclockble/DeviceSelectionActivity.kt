@@ -116,7 +116,11 @@ class DeviceSelectionActivity : AppCompatActivity() {
                     if (deviceName != null && deviceName.isNotEmpty() && !scannedDevices.contains(device)) {
                         runOnUiThread {
                             scannedDevices.add(device)
-                            updateFilteredDevices()
+                            val showOnlyDlg = filterDlgCheckbox?.isChecked ?: true
+                            if (!showOnlyDlg || (deviceName.startsWith("DLG"))) {
+                                filteredDevices.add(device)
+                                deviceListAdapter?.notifyItemInsertedAt(filteredDevices.size - 1)
+                            }
                         }
                     }
                 }
@@ -171,10 +175,6 @@ class DeviceSelectionActivity : AppCompatActivity() {
         }
 
         deviceListAdapter?.notifyDataSetChanged()
-
-        if (scanCallback == null) {
-            statusText?.text = "扫描完成，共发现 ${filteredDevices.size} 个设备"
-        }
     }
 
     private fun connectToDevice(device: BluetoothDevice) {

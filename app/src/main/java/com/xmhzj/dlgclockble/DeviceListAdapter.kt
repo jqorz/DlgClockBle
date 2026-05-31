@@ -35,4 +35,8 @@ class DeviceListAdapter(
     }
 
     override fun getItemCount() = devices.size
+
+    fun notifyItemInsertedAt(position: Int) {
+        notifyItemInserted(position)
+    }
 }
