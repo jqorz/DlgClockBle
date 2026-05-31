@@ -15,7 +15,7 @@
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
         <activity
-            android:name=".DeviceSelectionActivity"
+            android:name=".MainActivity"
             android:icon="@mipmap/ic_launcher"
             android:exported="true"
             android:launchMode="singleTop">
@@ -23,14 +23,6 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
-
-        <activity
-            android:name=".MainActivity"
-            android:icon="@mipmap/ic_launcher"
-            android:exported="false"
-            android:launchMode="singleInstance"
-            android:taskAffinity="com.xmhzj.dlgclockble.main">
         </activity>
 
         <activity
