@@ -57,6 +57,7 @@ object BleManager {
     private var scanCallback: ScanCallback? = null
     private val gattLock = Any()
     private val deviceTimeLock = Any()
+    @Volatile private var suppressDeviceTimeLog = false
     private var deviceTimeTimer: Timer? = null
     private var systemTimeTimer: Timer? = null
     private var context: Context? = null
@@ -289,8 +290,10 @@ object BleManager {
                     }
 
                     startDeviceTimeUpdate()
-                    synchronized(deviceTimeLock) {
-                        addLog("设备时间: ${formatTime(deviceTimeYear, deviceTimeMonth, deviceTimeDay, deviceTimeHour, deviceTimeMinute, deviceTimeSecond)}")
+                    if (!suppressDeviceTimeLog) {
+                        synchronized(deviceTimeLock) {
+                            addLog("设备时间: ${formatTime(deviceTimeYear, deviceTimeMonth, deviceTimeDay, deviceTimeHour, deviceTimeMinute, deviceTimeSecond)}")
+                        }
                     }
                 }
             }
@@ -445,7 +448,8 @@ object BleManager {
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]))
 
                 mainHandler.post { writeCharacteristic(longValueChar, buf) }
-                Thread.sleep(500)
+                // 等待设备端处理写入并更新BLE数据库
+                Thread.sleep(1000)
 
                 mainHandler.post { bluetoothGatt?.readCharacteristic(longValueChar) }
                 Thread.sleep(500)
@@ -594,6 +598,7 @@ object BleManager {
             return
         }
         _isCalibrating.value = true
+        suppressDeviceTimeLog = true
         addLog("开始时间校准...")
 
         Thread {
@@ -607,22 +612,21 @@ object BleManager {
                 val calMinute = if (lastSyncTimestamp == 0L) -1
                 else ((System.currentTimeMillis() - lastSyncTimestamp) / 60000).toInt()
 
-                addLog("等待分钟跳变，初始分钟: $initialMinute")
                 var waitCount = 0
-                while (waitCount < 700) {
+                // 最多等待240次 × 500ms = 120秒 = 2分钟
+                while (waitCount < 240) {
                     mainHandler.post { bluetoothGatt?.readCharacteristic(longValueChar) }
-                    Thread.sleep(150)
+                    Thread.sleep(500)
                     val currentMinute: Int
                     synchronized(deviceTimeLock) { currentMinute = deviceTimeMinute }
                     if (currentMinute != initialMinute) {
-                        addLog("检测到分钟跳变: $initialMinute -> $currentMinute")
                         break
                     }
                     waitCount++
                 }
 
-                if (waitCount >= 700) {
-                    addLog("等待超时，未检测到分钟跳变")
+                if (waitCount >= 240) {
+                    addLog("校准失败: 等待超时(2分钟)")
                     return@Thread
                 }
 
@@ -635,13 +639,11 @@ object BleManager {
                 val now = Calendar.getInstance()
                 var sysMinute = now.get(Calendar.MINUTE)
                 val sysSecond = now.get(Calendar.SECOND)
-                addLog("设备时间: ${devMinute}分${second}秒")
-                addLog("系统时间: ${sysMinute}分${sysSecond}秒")
 
                 if (calMinute == -1) {
-                    addLog("请先对时!")
+                    addLog("校准失败: 请先对时")
                 } else if (calMinute < 2880) {
-                    addLog("对时与校准间隔太短(小于两天)!")
+                    addLog("校准失败: 对时与校准间隔太短(小于两天)")
                 } else {
                     var calcDevMinute = devMinute
                     if (calcDevMinute > sysMinute) {
@@ -651,18 +653,18 @@ object BleManager {
                     }
 
                     val diff = (calcDevMinute * 60 + second) - (sysMinute * 60 + sysSecond)
-                    addLog("时间差: ${diff}秒")
 
                     val buf = ByteArray(3)
                     buf[0] = 0x92.toByte()
                     buf[1] = (diff and 0xFF).toByte()
                     buf[2] = ((diff shr 8) and 0xFF).toByte()
                     writeCharacteristic(longValueChar, buf)
-                    addLog("校准完成")
+                    addLog("校准完成: 误差${diff}秒")
                 }
             } catch (e: Exception) {
                 addLog("校准失败: ${e.message}")
             } finally {
+                suppressDeviceTimeLog = false
                 _isCalibrating.value = false
             }
         }.start()
