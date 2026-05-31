@@ -515,26 +515,31 @@ class MainActivity : AppCompatActivity() {
                 mainHandler.post(Runnable {
                     bluetoothGatt?.readCharacteristic(longValueChar)
                 })
-                Thread.sleep(300)
+                Thread.sleep(500)
 
+                val readYear: Int
+                val readMonth: Int
+                val readDay: Int
+                val readHour: Int
+                val readMinute: Int
+                val readSecond: Int
                 synchronized(deviceTimeLock) {
-                    addLog(String.format("设备回传时间: %d-%02d-%02d %02d:%02d:%02d",
-                        deviceTimeYear, deviceTimeMonth + 1, deviceTimeDay,
-                        deviceTimeHour, deviceTimeMinute, deviceTimeSecond))
+                    readYear = deviceTimeYear
+                    readMonth = deviceTimeMonth
+                    readDay = deviceTimeDay
+                    readHour = deviceTimeHour
+                    readMinute = deviceTimeMinute
+                    readSecond = deviceTimeSecond
                 }
 
-                // 更新设备时间基准值
-                synchronized(deviceTimeLock) {
-                    deviceTimeYear = year
-                    deviceTimeMonth = month
-                    deviceTimeDay = day
-                    deviceTimeHour = hour
-                    deviceTimeMinute = minute
-                    deviceTimeSecond = second
-                    deviceTimeBaseTimestamp = System.currentTimeMillis()
-                }
+                addLog(String.format("设备回传时间: %d-%02d-%02d %02d:%02d:%02d",
+                    readYear, readMonth + 1, readDay, readHour, readMinute, readSecond))
 
-                updateDeviceTime()
+                // 校验: 设备时间应与发送时间一致(分钟级别)
+                if (readYear != year || readMonth != month || readDay != day
+                    || readHour != hour || readMinute != minute) {
+                    addLog("警告: 设备时间与发送时间不一致，同步可能未生效")
+                }
                 lastSyncTimestamp = System.currentTimeMillis()
                 getSharedPreferences("calibration", MODE_PRIVATE).edit()
                     .putLong("last_sync_timestamp", lastSyncTimestamp)
@@ -594,6 +599,7 @@ class MainActivity : AppCompatActivity() {
                 buf[0] = 0xa0.toByte()
                 ByteBuffer.wrap(buf, 2, 2).order(ByteOrder.LITTLE_ENDIAN).putShort(firmSize.toShort())
                 writeCharacteristic(longValueChar, buf)
+                Thread.sleep(200)  // 等待设备准备好接收固件
 
                 var sent = 0
                 val totalSize = firmSize + 64
@@ -621,6 +627,7 @@ class MainActivity : AppCompatActivity() {
                         writeCharacteristic(longValueChar, buf)
                         sent += copyLen
                     }
+                    Thread.sleep(30)  // 防止BLE队列溢出
 
                     // 更新进度条
                     val progress = min((100.0 * sent / totalSize).toInt(), 100)
@@ -656,6 +663,13 @@ class MainActivity : AppCompatActivity() {
         send90Button!!.setEnabled(false)
         send90Button!!.setText("发送中...")
         addLog("发送切换命令...")
+
+        if (longValueChar == null || bluetoothGatt == null) {
+            addLog("错误: 未连接设备或服务未就绪")
+            send90Button!!.setEnabled(true)
+            send90Button!!.setText("切换时制")
+            return
+        }
 
         Thread(Runnable {
             try {
@@ -695,8 +709,10 @@ class MainActivity : AppCompatActivity() {
         Thread(Runnable {
             try {
                 // 读取当前时间
-                bluetoothGatt!!.readCharacteristic(longValueChar)
-                Thread.sleep(200)
+                mainHandler.post(Runnable {
+                    bluetoothGatt?.readCharacteristic(longValueChar)
+                })
+                Thread.sleep(300)
 
                 val initialMinute: Int
                 synchronized(deviceTimeLock) {
@@ -712,8 +728,10 @@ class MainActivity : AppCompatActivity() {
                 addLog("等待分钟跳变，初始分钟: " + initialMinute)
                 var waitCount = 0
                 while (waitCount < 700) {
-                    bluetoothGatt!!.readCharacteristic(longValueChar)
-                    Thread.sleep(100)
+                    mainHandler.post(Runnable {
+                        bluetoothGatt?.readCharacteristic(longValueChar)
+                    })
+                    Thread.sleep(150)
                     val currentMinute: Int
                     synchronized(deviceTimeLock) {
                         currentMinute = deviceTimeMinute
@@ -794,11 +812,11 @@ class MainActivity : AppCompatActivity() {
         addLog("发送数据 [" + data.size + " bytes]: " + hexStr.toString().trim { it <= ' ' })
         synchronized(gattLock) {
             try {
-                // 使用 WRITE_TYPE_NO_RESPONSE 避免等待设备回复导致超时断连
-                // 设备端EPD刷新耗时长，无法及时回复 Write Response
-                characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                // 使用 WRITE_TYPE_DEFAULT (Write Request) 确保设备端能收到写入通知
+                // 设备端SDK只处理 GATTC_WRITE_REQ_IND，不处理 GATTC_WRITE_CMD_IND
+                characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    bluetoothGatt!!.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                    bluetoothGatt!!.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
                 } else {
                     characteristic.setValue(data)
                     bluetoothGatt!!.writeCharacteristic(characteristic)
