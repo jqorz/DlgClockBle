@@ -58,7 +58,6 @@ object BleManager {
     private val gattLock = Any()
     private val deviceTimeLock = Any()
     @Volatile private var suppressDeviceTimeLog = false
-    private var deviceTimeTimer: Timer? = null
     private var systemTimeTimer: Timer? = null
     private var context: Context? = null
 
@@ -100,9 +99,6 @@ object BleManager {
     private val _voltage = MutableStateFlow("--")
     val voltage: StateFlow<String> = _voltage.asStateFlow()
 
-    private val _deviceTime = MutableStateFlow("--")
-    val deviceTime: StateFlow<String> = _deviceTime.asStateFlow()
-
     private val _systemTime = MutableStateFlow("")
     val systemTime: StateFlow<String> = _systemTime.asStateFlow()
 
@@ -120,9 +116,6 @@ object BleManager {
 
     private val _isSending90 = MutableStateFlow(false)
     val isSending90: StateFlow<Boolean> = _isSending90.asStateFlow()
-
-    private val _isCalibrating = MutableStateFlow(false)
-    val isCalibrating: StateFlow<Boolean> = _isCalibrating.asStateFlow()
 
     private var lastSyncTimestamp: Long = 0
 
@@ -190,9 +183,6 @@ object BleManager {
     }
 
     fun disconnect() {
-        deviceTimeTimer?.cancel()
-        deviceTimeTimer = null
-
         synchronized(gattLock) {
             bluetoothGatt?.disconnect()
             bluetoothGatt?.close()
@@ -202,7 +192,6 @@ object BleManager {
         _connectionState.value = ConnectionState.DISCONNECTED
         _deviceName.value = ""
         _voltage.value = "--"
-        _deviceTime.value = "--"
         addLog("设备已断开连接")
     }
 
@@ -289,7 +278,6 @@ object BleManager {
                         deviceTimeBaseTimestamp = System.currentTimeMillis()
                     }
 
-                    startDeviceTimeUpdate()
                     if (!suppressDeviceTimeLog) {
                         synchronized(deviceTimeLock) {
                             addLog("设备时间: ${formatTime(deviceTimeYear, deviceTimeMonth, deviceTimeDay, deviceTimeHour, deviceTimeMinute, deviceTimeSecond)}")
@@ -324,54 +312,7 @@ object BleManager {
         }
     }
 
-    // --- Device time ---
-
-    private fun startDeviceTimeUpdate() {
-        deviceTimeTimer?.cancel()
-        deviceTimeTimer = Timer()
-        deviceTimeTimer!!.schedule(object : TimerTask() {
-            override fun run() {
-                updateDeviceTime()
-            }
-        }, 0, 1000)
-    }
-
-    private fun updateDeviceTime() {
-        val year: Int
-        val month: Int
-        val day: Int
-        val hour: Int
-        val minute: Int
-        val second: Int
-        val baseTimestamp: Long
-
-        synchronized(deviceTimeLock) {
-            year = deviceTimeYear
-            month = deviceTimeMonth
-            day = deviceTimeDay
-            hour = deviceTimeHour
-            minute = deviceTimeMinute
-            second = deviceTimeSecond
-            baseTimestamp = deviceTimeBaseTimestamp
-        }
-
-        val elapsedSeconds = (System.currentTimeMillis() - baseTimestamp) / 1000
-        val totalSeconds = second + elapsedSeconds.toInt()
-        val sec = totalSeconds % 60
-        val totalMinutes = minute + totalSeconds / 60
-        val min = totalMinutes % 60
-        val totalHours = hour + totalMinutes / 60
-        val hr = totalHours % 24
-        val extraDays = totalHours / 24
-        val cal = Calendar.getInstance()
-        cal.set(year, month, day + extraDays, hr, min, sec)
-        _deviceTime.value = formatTime(
-            cal.get(Calendar.YEAR),
-            cal.get(Calendar.MONTH),
-            cal.get(Calendar.DAY_OF_MONTH),
-            hr, min, sec
-        )
-    }
+    // --- System time ---
 
     private fun startSystemTimeUpdate() {
         systemTimeTimer?.cancel()
@@ -407,6 +348,52 @@ object BleManager {
 
         Thread {
             try {
+                // --- 自动校准：在同步前检测是否需要校准 ---
+                // 校准必须在同步之前执行，因为它测量的是上次同步以来的漂移
+                // 同步会更新 lastSyncTimestamp，之后 calMinute 就变成 0 了
+                val calMinute = if (lastSyncTimestamp == 0L) -1
+                else ((System.currentTimeMillis() - lastSyncTimestamp) / 60000).toInt()
+
+                if (calMinute >= 2880) {
+                    addLog("检测到距上次对时已超过2天，自动校准中...")
+                    suppressDeviceTimeLog = true
+                    try {
+                        mainHandler.post { bluetoothGatt?.readCharacteristic(longValueChar) }
+                        Thread.sleep(500)
+
+                        var devSecond = 0
+                        var devMinute = 0
+                        synchronized(deviceTimeLock) {
+                            devSecond = deviceTimeSecond
+                            devMinute = deviceTimeMinute
+                        }
+
+                        val now = Calendar.getInstance()
+                        var sysMinute = now.get(Calendar.MINUTE)
+                        val sysSecond = now.get(Calendar.SECOND)
+
+                        var calcDevMinute = devMinute
+                        if (calcDevMinute > sysMinute) {
+                            if (calcDevMinute - sysMinute > 50) sysMinute += 60
+                        } else {
+                            if (sysMinute - calcDevMinute > 50) calcDevMinute += 60
+                        }
+
+                        val diff = (calcDevMinute * 60 + devSecond) - (sysMinute * 60 + sysSecond)
+
+                        val calBuf = ByteArray(3)
+                        calBuf[0] = 0x92.toByte()
+                        calBuf[1] = (diff and 0xFF).toByte()
+                        calBuf[2] = ((diff shr 8) and 0xFF).toByte()
+                        writeCharacteristic(longValueChar, calBuf)
+                        addLog("自动校准完成: 误差${diff}秒")
+                        Thread.sleep(500)
+                    } finally {
+                        suppressDeviceTimeLog = false
+                    }
+                }
+
+                // --- 同步时间 ---
                 val startTime = System.currentTimeMillis()
                 val waitTime = 1000 - (startTime % 1000)
                 if (waitTime > 10) Thread.sleep(waitTime)
@@ -588,84 +575,6 @@ object BleManager {
                 addLog("发送失败: ${e.message}")
             } finally {
                 _isSending90.value = false
-            }
-        }.start()
-    }
-
-    fun calibrateTime() {
-        if (bluetoothGatt == null || longValueChar == null) {
-            addLog("错误: 未连接设备或服务未就绪")
-            return
-        }
-        _isCalibrating.value = true
-        suppressDeviceTimeLog = true
-        addLog("开始时间校准...")
-
-        Thread {
-            try {
-                mainHandler.post { bluetoothGatt?.readCharacteristic(longValueChar) }
-                Thread.sleep(300)
-
-                val initialMinute: Int
-                synchronized(deviceTimeLock) { initialMinute = deviceTimeMinute }
-
-                val calMinute = if (lastSyncTimestamp == 0L) -1
-                else ((System.currentTimeMillis() - lastSyncTimestamp) / 60000).toInt()
-
-                var waitCount = 0
-                // 最多等待240次 × 500ms = 120秒 = 2分钟
-                while (waitCount < 240) {
-                    mainHandler.post { bluetoothGatt?.readCharacteristic(longValueChar) }
-                    Thread.sleep(500)
-                    val currentMinute: Int
-                    synchronized(deviceTimeLock) { currentMinute = deviceTimeMinute }
-                    if (currentMinute != initialMinute) {
-                        break
-                    }
-                    waitCount++
-                }
-
-                if (waitCount >= 240) {
-                    addLog("校准失败: 等待超时(2分钟)")
-                    return@Thread
-                }
-
-                val second: Int
-                val devMinute: Int
-                synchronized(deviceTimeLock) {
-                    second = deviceTimeSecond
-                    devMinute = deviceTimeMinute
-                }
-                val now = Calendar.getInstance()
-                var sysMinute = now.get(Calendar.MINUTE)
-                val sysSecond = now.get(Calendar.SECOND)
-
-                if (calMinute == -1) {
-                    addLog("校准失败: 请先对时")
-                } else if (calMinute < 2880) {
-                    addLog("校准失败: 对时与校准间隔太短(小于两天)")
-                } else {
-                    var calcDevMinute = devMinute
-                    if (calcDevMinute > sysMinute) {
-                        if (calcDevMinute - sysMinute > 50) sysMinute += 60
-                    } else {
-                        if (sysMinute - calcDevMinute > 50) calcDevMinute += 60
-                    }
-
-                    val diff = (calcDevMinute * 60 + second) - (sysMinute * 60 + sysSecond)
-
-                    val buf = ByteArray(3)
-                    buf[0] = 0x92.toByte()
-                    buf[1] = (diff and 0xFF).toByte()
-                    buf[2] = ((diff shr 8) and 0xFF).toByte()
-                    writeCharacteristic(longValueChar, buf)
-                    addLog("校准完成: 误差${diff}秒")
-                }
-            } catch (e: Exception) {
-                addLog("校准失败: ${e.message}")
-            } finally {
-                suppressDeviceTimeLog = false
-                _isCalibrating.value = false
             }
         }.start()
     }

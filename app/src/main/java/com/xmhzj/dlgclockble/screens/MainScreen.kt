@@ -26,15 +26,12 @@ fun MainScreen(onDisconnect: () -> Unit) {
     val connectionState by BleManager.connectionState.collectAsState()
     val deviceName by BleManager.deviceName.collectAsState()
     val voltage by BleManager.voltage.collectAsState()
-    val deviceTime by BleManager.deviceTime.collectAsState()
     val systemTime by BleManager.systemTime.collectAsState()
     val logs by BleManager.logs.collectAsState()
     val firmwareProgress by BleManager.firmwareProgress.collectAsState()
     val isSyncing by BleManager.isSyncing.collectAsState()
     val isUpdating by BleManager.isUpdating.collectAsState()
     val isSending90 by BleManager.isSending90.collectAsState()
-    val isCalibrating by BleManager.isCalibrating.collectAsState()
-
     val functionsReady = connectionState == ConnectionState.SERVICE_READY
 
     val firmwareLauncher = rememberLauncherForActivityResult(
@@ -130,13 +127,6 @@ fun MainScreen(onDisconnect: () -> Unit) {
                         onClick = { BleManager.switchTimeFormat() },
                         modifier = Modifier.weight(1f)
                     )
-                    FuncButton(
-                        text = if (isCalibrating) "校准中..." else "时间校准",
-                        color = Color(0xFF10B981),
-                        enabled = functionsReady && !isCalibrating,
-                        onClick = { BleManager.calibrateTime() },
-                        modifier = Modifier.weight(1f)
-                    )
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))
@@ -151,8 +141,6 @@ fun MainScreen(onDisconnect: () -> Unit) {
                     InfoRow(label = "设备名称", value = deviceName)
                     Spacer(modifier = Modifier.height(8.dp))
                     InfoRow(label = "当前电压", value = voltage)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    InfoRow(label = "设备时间", value = deviceTime)
                     Spacer(modifier = Modifier.height(8.dp))
                     InfoRow(label = "系统时间", value = systemTime)
                 }
