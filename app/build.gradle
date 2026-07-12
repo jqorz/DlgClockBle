@@ -15,7 +15,14 @@ android {
         versionCode 1
         versionName "1.0"
     }
-
+    signingConfigs {
+        debug {
+            storeFile file("../debug_key.jks")
+            storePassword "123456"
+            keyAlias "key"
+            keyPassword "123456"
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
