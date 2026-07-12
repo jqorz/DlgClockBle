@@ -4,6 +4,10 @@ plugins {
     id 'org.jetbrains.kotlin.plugin.compose'
 }
 
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+
 android {
     namespace 'com.xmhzj.dlgclockble'
     compileSdk 34
@@ -21,6 +25,12 @@ android {
             storePassword "123456"
             keyAlias "key"
             keyPassword "123456"
+        }
+        release {
+            storeFile file(keystoreProperties['RELEASE_STORE_FILE'])
+            storePassword keystoreProperties['RELEASE_KEYSTORE_PASSWORD']
+            keyAlias keystoreProperties['RELEASE_KEY_ALIAS']
+            keyPassword keystoreProperties['RELEASE_KEY_PASSWORD']
         }
     }
     buildTypes {
