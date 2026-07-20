@@ -31,9 +31,8 @@ class MainActivity : ComponentActivity() {
                     composable("main") {
                         MainScreen(
                             onDisconnect = {
-                                navController.navigate("device_selection") {
-                                    popUpTo("device_selection") { inclusive = true }
-                                }
+                                // 弹出当前页面，直接返回到设备选择页
+                                navController.popBackStack()
                             }
                         )
                     }

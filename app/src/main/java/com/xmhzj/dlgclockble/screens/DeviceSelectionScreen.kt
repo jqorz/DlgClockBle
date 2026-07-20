@@ -59,7 +59,8 @@ fun DeviceSelectionScreen(navController: NavController) {
         if (connectionState == ConnectionState.SERVICE_READY) {
             val name = BleManager.deviceName.value
             navController.navigate("main") {
-                popUpTo("device_selection") { inclusive = true }
+                // 保持 device_selection 页面在栈中，不清除它
+                popUpTo("device_selection") { inclusive = false }
             }
         }
     }
