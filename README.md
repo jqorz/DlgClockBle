@@ -7,5 +7,3 @@
 #新UI
 ![设备列表界面](Screenshot_main.png)
 ![蓝牙控制界面](Screenshot_control.png)
-#旧UI
-![Screenshot.jpg](Screenshot_old.jpg)

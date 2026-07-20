@@ -11,8 +11,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="价签时钟对时"
-        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+        android:label="价签时钟对时">
 
         <activity
             android:name=".MainActivity"

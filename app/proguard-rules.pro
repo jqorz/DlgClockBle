@@ -1,57 +1,20 @@
-# 通用Android混淆规则
--keep class android.support.** { *; }
--keep interface android.support.** { *; }
+# 激进优化配置
+-optimizationpasses 5
+-allowaccessmodification
+-repackageclasses ''
+-overloadaggressively
+-mergeinterfacesaggressively
+-dontusemixedcaseclassnames
+-dontskipnonpubliclibraryclasses
 
-# Kotlin相关规则
--keep class kotlin.** { *; }
--keep class kotlinx.** { *; }
--dontwarn kotlin.**
--dontwarn kotlinx.**
-
-# Kotlin协程
--keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
--keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
+# Kotlin协程优化
 -keepclassmembernames class kotlinx.** {
     volatile <fields>;
 }
 
-# Jetpack Compose相关规则
--keep class androidx.compose.** { *; }
--keep interface androidx.compose.** { *; }
--dontwarn androidx.compose.**
-
-# Compose UI工具
--keep class androidx.compose.ui.tooling.** { *; }
--dontwarn androidx.compose.ui.tooling.**
-
-# AndroidX Lifecycle
--keep class androidx.lifecycle.** { *; }
--keep interface androidx.lifecycle.** { *; }
--dontwarn androidx.lifecycle.**
-
-# Navigation Compose
--keep class androidx.navigation.** { *; }
--keep interface androidx.navigation.** { *; }
--dontwarn androidx.navigation.**
-
-# Activity Compose
--keep class androidx.activity.** { *; }
--keep interface androidx.activity.** { *; }
--dontwarn androidx.activity.**
-
-# Material 3
--keep class androidx.compose.material3.** { *; }
--keep interface androidx.compose.material3.** { *; }
--dontwarn androidx.compose.material3.**
-
-# Bluetooth相关规则
--keep class android.bluetooth.** { *; }
--keep interface android.bluetooth.** { *; }
--dontwarn android.bluetooth.**
-
-# BleManager单例类保持
+# 核心类保持（最小化保护）
 -keep class com.xmhzj.dlgclockble.BleManager { *; }
--keep class com.xmhzj.dlgclockble.BleManager$** { *; }
+-keep class com.xmhzj.dlgclockble.ConnectionState { *; }
 
 # 枚举类保持
 -keepclassmembers enum com.xmhzj.dlgclockble.** {
@@ -59,76 +22,40 @@
     public static ** valueOf(java.lang.String);
 }
 
-# Parcelable类
--keep class * implements android.os.Parcelable {
-  public static final android.os.Parcelable$Creator *;
-}
-
-# Serializable类
--keepclassmembers class * implements java.io.Serializable {
-    static final long serialVersionUID;
-    private static final java.io.ObjectStreamField[] serialPersistentFields;
-    private void writeObject(java.io.ObjectOutputStream);
-    private void readObject(java.io.ObjectInputStream);
-    java.lang.Object writeReplace();
-    java.lang.Object readResolve();
-}
-
 # 第三方库：tyme4kt（农历日历库）
 -keep class cn.6tail.tyme.** { *; }
 -dontwarn cn.6tail.tyme.**
 
-# Composable函数（@Composable注解的方法）
--keep class * {
+# Compose基础规则（精简版）
+-keep,allowobfuscation class * {
     @androidx.compose.runtime.Composable public *(...);
-    @kotlin androidx.compose.runtime.ComposableInvalidateGroup public *(...);
 }
 
-# 内联函数优化
--optimizationpasses 5
--dontusemixedcaseclassnames
--dontskipnonpubliclibraryclasses
--dontpreverify
--verbose
-
-# 移除日志
+# 移除所有日志输出
 -assumenosideeffects class android.util.Log {
-    public static *** v(...);
-    public static *** d(...);
-    public static *** i(...);
-    public static *** w(...);
+    public static boolean isLoggable(java.lang.String, int);
+    public static int v(...);
+    public static int d(...);
+    public static int i(...);
+    public static int w(...);
+    public static int e(...);
+    public static int println(...);
 }
 
-# 保留Native方法
--keepclasseswithmembernames class * {
-    native <methods>;
+# 移除Log调用
+-assumenosideeffects class java.io.PrintStream {
+    public void println(...);
+    public void print(...);
 }
 
-# 保留构造函数
--keepclasseswithmembernames class * {
-    public <init>(android.content.Context);
-}
+# 保留必要的系统类
+-keep class androidx.activity.** { *; }
+-keep class androidx.compose.ui.** { *; }
+-keep class androidx.compose.material3.** { *; }
+-keep class androidx.navigation.** { *; }
 
-# 保留自定义View
--keep public class * extends android.view.View {
-    public <init>(android.content.Context);
-    public <init>(android.content.Context, android.util.AttributeSet);
-    public <init>(android.content.Context, android.util.AttributeSet, int);
-    public void set*(...);
-}
-
-# 保留R文件
--keep class **.R
--keep class **.R$* {
-    public static final int *;
-}
-
-# 保留BuildConfig
--keep class **.BuildConfig { *; }
-
-# 优化建议
--optimizationpasses 5
--overloadaggressively
--repackageclasses ''
--allowaccessmodification
--mergeinterfacesaggressively
+# 警告抑制
+-dontwarn androidx.compose.**
+-dontwarn androidx.activity.**
+-dontwarn androidx.navigation.**
+-dontwarn android.bluetooth.**
