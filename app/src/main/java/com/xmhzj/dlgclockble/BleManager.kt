@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
@@ -38,6 +39,9 @@ import kotlin.math.min
 enum class ConnectionState {
     DISCONNECTED, CONNECTING, CONNECTED, SERVICE_READY
 }
+
+// 扫描到的设备及其广播中的固件版本号(EPD_VERSION低16位，厂商AD数据携带，null=未解析到)
+data class ScannedDevice(val device: BluetoothDevice, val version: Int?)
 
 @SuppressLint("MissingPermission")
 object BleManager {
@@ -84,8 +88,8 @@ object BleManager {
 
     // --- StateFlows ---
 
-    private val _scannedDevices = MutableStateFlow<List<BluetoothDevice>>(emptyList())
-    val scannedDevices: StateFlow<List<BluetoothDevice>> = _scannedDevices.asStateFlow()
+    private val _scannedDevices = MutableStateFlow<List<ScannedDevice>>(emptyList())
+    val scannedDevices: StateFlow<List<ScannedDevice>> = _scannedDevices.asStateFlow()
 
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
@@ -119,6 +123,9 @@ object BleManager {
 
     private var lastSyncTimestamp: Long = 0
 
+    // 当前连接设备广播中的固件版本号(来自扫描列表)，用于决定OTA传输模式
+    @Volatile private var connectedFwVersion: Int? = null
+
     fun init(appContext: Context) {
         context = appContext.applicationContext
         val manager = appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -142,9 +149,14 @@ object BleManager {
                 val device = result.device
                 val deviceName = device.name
                 if (deviceName != null && deviceName.isNotEmpty()) {
+                    val version = parseAdvVersion(result.scanRecord)
                     val current = _scannedDevices.value
-                    if (current.none { it.address == device.address }) {
-                        _scannedDevices.value = current + device
+                    val idx = current.indexOfFirst { it.device.address == device.address }
+                    if (idx == -1) {
+                        _scannedDevices.value = current + ScannedDevice(device, version)
+                    } else if (version != null && current[idx].version != version) {
+                        // 广播重复到达时刷新为最新版本
+                        _scannedDevices.value = current.toMutableList().apply { set(idx, ScannedDevice(device, version)) }
                     }
                 }
             }
@@ -173,11 +185,12 @@ object BleManager {
 
     // --- Connection ---
 
-    fun connect(device: BluetoothDevice) {
+    fun connect(device: BluetoothDevice, fwVersion: Int? = null) {
         stopScan()
+        connectedFwVersion = fwVersion
         _connectionState.value = ConnectionState.CONNECTING
         _deviceName.value = device.name ?: device.address
-        addLog("正在连接设备: ${_deviceName.value}")
+        addLog("正在连接设备: ${_deviceName.value}${fwVersion?.let { " (固件 v$it)" } ?: ""}")
 
         bluetoothGatt = device.connectGatt(context, false, gattCallback)
     }
@@ -192,6 +205,7 @@ object BleManager {
         _connectionState.value = ConnectionState.DISCONNECTED
         _deviceName.value = ""
         _voltage.value = "--"
+        connectedFwVersion = null
         addLog("设备已断开连接")
     }
 
@@ -507,14 +521,27 @@ object BleManager {
                 val firmCrc = crc32(firmBuf)
                 addLog("固件版本: $firmVer 大小: $firmSize CRC: ${Integer.toHexString(firmCrc)}")
 
+                // 镜像槽容量 = 0xC000(48KB) - 64B头 = 49088字节；超限说明选错了文件
+                if (firmSize > 49088 || firmSize < 1024) {
+                    addLog("错误: 固件大小 $firmSize 字节不合法(允许1024~49088)。请选择RAM运行版bin(如ble_app_peripheral_585.bin，约44KB)，不要选fw_multi_part_spi.bin(整块flash布局镜像)")
+                    return@Thread
+                }
+
+                // 有响应写：兼容所有固件版本(无响应写需固件带PERM(WRITE_COMMAND)权限，
+                // 但该权限的构建曾出现OTA后启动即死，已放弃)，writeWithRetry自动排队不丢包
+                addLog("传输模式: 有响应写(约3分钟)")
+
                 val buf = ByteArray(136)
                 buf[0] = 0xa0.toByte()
                 ByteBuffer.wrap(buf, 2, 2).order(ByteOrder.LITTLE_ENDIAN).putShort(firmSize.toShort())
-                writeCharacteristic(longValueChar, buf)
+                writeWithRetry(longValueChar, buf)
                 Thread.sleep(200)
 
                 var sent = 0
                 val totalSize = firmSize + 64
+                // 固件OTA协议：flash每页256字节 = 0xa2(页前128字节) + 0xa3(页后128字节，收到0xa3才整页写入)
+                // 首包0xa2的[8..40]为64字节image header，[72..135]为固件前64字节
+                var frontHalf = true // 下一包是否为页前半(0xa2)
 
                 var i = 0
                 while (i < totalSize) {
@@ -525,18 +552,17 @@ object BleManager {
                         ByteBuffer.wrap(buf, 16, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(firmCrc)
                         ByteBuffer.wrap(buf, 36, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(-0x5af10000 + firmVer)
                         buf[40] = 0
-                        buf[0] = 0xa1.toByte()
                         System.arraycopy(firmBuf, sent, buf, 72, 64)
-                        writeCharacteristic(longValueChar, buf)
                         sent += 64
                     } else {
-                        buf[0] = 0xa1.toByte()
                         val copyLen = min(128, firmBuf.size - sent)
                         if (copyLen <= 0) break
                         System.arraycopy(firmBuf, sent, buf, 8, copyLen)
-                        writeCharacteristic(longValueChar, buf)
                         sent += copyLen
                     }
+                    buf[0] = if (frontHalf) 0xa2.toByte() else 0xa3.toByte()
+                    writeWithRetry(longValueChar, buf, logBytes = (i == 0))
+                    frontHalf = !frontHalf
                     Thread.sleep(30)
 
                     val progress = min((100.0 * sent / totalSize).toInt(), 100)
@@ -544,10 +570,19 @@ object BleManager {
                     i += if (i == 0) 64 else 128
                 }
 
-                buf[0] = 0xa2.toByte()
+                // 最后一包若是页前半(0xa2)，补一包0xa3(0xff填充)把最后的半页刷进flash
+                if (!frontHalf) {
+                    Arrays.fill(buf, 0xff.toByte())
+                    buf[0] = 0xa3.toByte()
+                    writeWithRetry(longValueChar, buf, logBytes = false)
+                    Thread.sleep(30)
+                }
+
+                // 0xa4=升级结束：固件恢复睡眠并复位重启，booter加载新镜像
+                buf[0] = 0xa4.toByte()
                 Arrays.fill(buf, 1, 4, 0.toByte())
-                writeCharacteristic(longValueChar, buf)
-                addLog("升级完成")
+                writeWithRetry(longValueChar, buf)
+                addLog("升级完成，设备将自动重启")
             } catch (e: Exception) {
                 addLog("升级失败: ${e.message}")
             } finally {
@@ -581,25 +616,66 @@ object BleManager {
 
     // --- Helpers ---
 
-    private fun writeCharacteristic(characteristic: BluetoothGattCharacteristic?, data: ByteArray) {
+    // 解析广播原始数据中的厂商AD(类型0xFF)。固件把EPD_VERSION低16位放在厂商数据前两字节(小端)
+    private fun parseAdvVersion(record: android.bluetooth.le.ScanRecord?): Int? {
+        val bytes = record?.bytes ?: return null
+        var i = 0
+        while (i + 1 < bytes.size) {
+            val len = bytes[i].toInt() and 0xFF
+            if (len == 0 || i + 1 + len > bytes.size) break
+            if ((bytes[i + 1].toInt() and 0xFF) == 0xFF && len >= 3) {
+                return (bytes[i + 2].toInt() and 0xFF) or ((bytes[i + 3].toInt() and 0xFF) shl 8)
+            }
+            i += 1 + len
+        }
+        return null
+    }
+
+    private fun writeCharacteristic(
+        characteristic: BluetoothGattCharacteristic?,
+        data: ByteArray,
+        logBytes: Boolean = true,
+        writeType: Int = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+    ): Boolean {
         if (characteristic == null || bluetoothGatt == null) {
             addLog("错误: characteristic或gatt为null")
-            return
+            return false
         }
-        val hexStr = data.joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }
-        addLog("发送数据 [${data.size} bytes]: $hexStr")
+        // OTA数据包有几百包，逐包打印字节会刷屏；logBytes=false时跳过字节dump
+        if (logBytes) {
+            val hexStr = data.joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }
+            addLog("发送数据 [${data.size} bytes]: $hexStr")
+        }
         synchronized(gattLock) {
             try {
-                characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    bluetoothGatt!!.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                characteristic.setWriteType(writeType)
+                // API33+的3参writeCharacteristic返回Int(BluetoothStatusCodes.SUCCESS)，旧版返回Boolean，统一成Boolean
+                val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    bluetoothGatt!!.writeCharacteristic(characteristic, data, writeType) == BluetoothStatusCodes.SUCCESS
                 } else {
                     characteristic.setValue(data)
                     bluetoothGatt!!.writeCharacteristic(characteristic)
                 }
+                if (!ok) Log.w(TAG, "writeCharacteristic rejected (busy?) uuid=${characteristic.uuid}")
+                return ok
             } catch (e: Exception) {
                 addLog("写入失败: ${e.message}")
+                return false
             }
+        }
+    }
+
+    // 带重试的写入：BLE栈在上一操作未完成时会拒绝新写入(返回false)，静默丢包会造成OTA数据空洞
+    private fun writeWithRetry(
+        characteristic: BluetoothGattCharacteristic?,
+        data: ByteArray,
+        writeType: Int = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+        logBytes: Boolean = true
+    ) {
+        var retry = 0
+        while (!writeCharacteristic(characteristic, data, logBytes, writeType)) {
+            if (++retry >= 50) throw IllegalStateException("BLE写入连续失败(已重试${retry}次)")
+            Thread.sleep(20)
         }
     }
 

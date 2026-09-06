@@ -2,7 +2,6 @@ package com.xmhzj.dlgclockble.screens
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothDevice
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,6 +24,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.navigation.NavController
 import com.xmhzj.dlgclockble.BleManager
 import com.xmhzj.dlgclockble.ConnectionState
+import com.xmhzj.dlgclockble.ScannedDevice
 
 @SuppressLint("MissingPermission")
 @Composable
@@ -66,7 +66,7 @@ fun DeviceSelectionScreen(navController: NavController) {
     }
 
     val filteredDevices = if (filterDlg) {
-        devices.filter { it.name?.startsWith("DLG") == true }
+        devices.filter { it.device.name?.startsWith("DLG") == true }
     } else {
         devices
     }
@@ -139,9 +139,9 @@ fun DeviceSelectionScreen(navController: NavController) {
                 .background(Color(0xFFF5F5F5), RoundedCornerShape(8.dp))
                 .padding(8.dp)
         ) {
-            items(filteredDevices, key = { it.address }) { device ->
-                DeviceItem(device = device) {
-                    BleManager.connect(device)
+            items(filteredDevices, key = { it.device.address }) { item ->
+                DeviceItem(item = item) {
+                    BleManager.connect(item.device, item.version)
                 }
             }
         }
@@ -157,7 +157,7 @@ fun DeviceSelectionScreen(navController: NavController) {
 }
 
 @Composable
-private fun DeviceItem(device: BluetoothDevice, onClick: () -> Unit) {
+private fun DeviceItem(item: ScannedDevice, onClick: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -168,16 +168,24 @@ private fun DeviceItem(device: BluetoothDevice, onClick: () -> Unit) {
             .padding(12.dp)
     ) {
         Text(
-            text = device.name ?: "未知设备",
+            text = item.device.name ?: "未知设备",
             fontSize = 16.sp,
             fontWeight = FontWeight.Bold,
             color = Color(0xFF333333)
         )
-        Text(
-            text = device.address,
-            fontSize = 12.sp,
-            color = Color(0xFF999999)
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = item.device.address,
+                fontSize = 12.sp,
+                color = Color(0xFF999999)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = item.version?.let { "固件 v$it" } ?: "版本未知",
+                fontSize = 12.sp,
+                color = Color(0xFF2E7D32)
+            )
+        }
     }
 }
 
