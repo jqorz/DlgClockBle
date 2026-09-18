@@ -31,6 +31,8 @@ import java.nio.ByteOrder
 import java.util.Arrays
 import java.util.Calendar
 import java.util.Timer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.TimerTask
 import java.util.UUID
 import kotlin.concurrent.Volatile
@@ -216,12 +218,22 @@ object BleManager {
                 _connectionState.value = ConnectionState.CONNECTED
                 addLog("已连接 (status=0x${status.toString(16)})")
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                gatt.discoverServices()
+                // 先协商MTU(默认23会把136字节OTA包拆成9个ATT事务，慢且易积压丢包)，
+                // 协商完成再发现服务。设备端max_mtu=192，185足够单事务发包
+                if (!gatt.requestMtu(185)) {
+                    addLog("MTU协商请求失败，使用默认MTU")
+                    gatt.discoverServices()
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.w(TAG, "BLE DISCONNECTED status=0x${status.toString(16)}")
                 addLog("BLE断开! status=0x${status.toString(16)}")
                 disconnect()
             }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            addLog("MTU协商完成: $mtu (status=0x${status.toString(16)})")
+            gatt.discoverServices()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -245,7 +257,8 @@ object BleManager {
                     }
 
                     if (longValueChar != null) {
-                        longValueChar!!.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                        // 写类型由writeCharacteristic按参数统一设置(WRITE_TYPE_DEFAULT)，
+                        // 设备端仅开通有响应写权限，不能预设NO_RESPONSE(无Write Response回调)
                         gatt.setCharacteristicNotification(longValueChar, true)
                         val longDescriptor = longValueChar!!.getDescriptor(
                             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -307,6 +320,18 @@ object BleManager {
             status: Int
         ) {
             val uuid = characteristic?.uuid?.toString() ?: "unknown"
+            // 完成OTA线程等待的写确认(Write Response)
+            val latch = pendingWriteAck
+            if (latch != null) {
+                pendingWriteOk = (status == BluetoothGatt.GATT_SUCCESS)
+                latch.countDown()
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.d(TAG, "onCharacteristicWrite SUCCESS uuid=$uuid")
+                } else {
+                    Log.e(TAG, "onCharacteristicWrite FAILED uuid=$uuid status=0x${status.toString(16)}")
+                }
+                return
+            }
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "onCharacteristicWrite SUCCESS uuid=$uuid")
             } else {
@@ -528,8 +553,8 @@ object BleManager {
                 }
 
                 // 有响应写：兼容所有固件版本(无响应写需固件带PERM(WRITE_COMMAND)权限，
-                // 但该权限的构建曾出现OTA后启动即死，已放弃)，writeWithRetry自动排队不丢包
-                addLog("传输模式: 有响应写(约3分钟)")
+                // 但该权限的构建曾出现OTA后启动即死，已放弃)。每包等待设备Write Response
+                addLog("传输模式: 有响应写(每包等设备确认)")
 
                 val buf = ByteArray(136)
                 buf[0] = 0xa0.toByte()
@@ -578,11 +603,20 @@ object BleManager {
                     Thread.sleep(30)
                 }
 
-                // 0xa4=升级结束：固件恢复睡眠并复位重启，booter加载新镜像
+                // 0xa4=升级结束(旧固件靠它复位；新固件写完最后一页会自行断开重启，
+                // 此时0xa4撞上断链属正常，不能当失败)
                 buf[0] = 0xa4.toByte()
                 Arrays.fill(buf, 1, 4, 0.toByte())
-                writeWithRetry(longValueChar, buf)
-                addLog("升级完成，设备将自动重启")
+                try {
+                    writeWithRetry(longValueChar, buf)
+                    addLog("升级完成，设备将自动重启")
+                } catch (e: Exception) {
+                    if (bluetoothGatt == null || _connectionState.value == ConnectionState.DISCONNECTED) {
+                        addLog("升级完成，设备已重启(连接断开属正常)")
+                    } else {
+                        throw e
+                    }
+                }
             } catch (e: Exception) {
                 addLog("升级失败: ${e.message}")
             } finally {
@@ -665,7 +699,13 @@ object BleManager {
         }
     }
 
-    // 带重试的写入：BLE栈在上一操作未完成时会拒绝新写入(返回false)，静默丢包会造成OTA数据空洞
+    // 待确认写操作桥接：OTA线程提交写后在onCharacteristicWrite收到Write Response时释放
+    @Volatile private var pendingWriteAck: CountDownLatch? = null
+    @Volatile private var pendingWriteOk = false
+
+    // 带重试的写入：提交后等待设备回Write Response才发下一包。
+    // 只依赖writeCharacteristic的返回值(仅表示已入队)会在栈内队列积压时静默丢包——
+    // OTA末尾的0xa4命令就是这样丢的，设备收到0xa0后ota_state不清零，界面永久冻结。
     private fun writeWithRetry(
         characteristic: BluetoothGattCharacteristic?,
         data: ByteArray,
@@ -673,7 +713,24 @@ object BleManager {
         logBytes: Boolean = true
     ) {
         var retry = 0
-        while (!writeCharacteristic(characteristic, data, logBytes, writeType)) {
+        while (true) {
+            if (bluetoothGatt == null) throw IllegalStateException("连接已断开")
+            val latch = CountDownLatch(1)
+            pendingWriteAck = latch
+            pendingWriteOk = false
+            if (writeCharacteristic(characteristic, data, logBytes, writeType)) {
+                // 有响应写：等设备的Write Response(重传由链路层保证，这里只等结果)
+                if (latch.await(3, TimeUnit.SECONDS)) {
+                    if (pendingWriteOk) {
+                        pendingWriteAck = null
+                        return
+                    }
+                    addLog("写入被拒绝(status!=0)，重试(${retry + 1})")
+                } else {
+                    addLog("写入响应超时，重试(${retry + 1})")
+                }
+            }
+            pendingWriteAck = null
             if (++retry >= 50) throw IllegalStateException("BLE写入连续失败(已重试${retry}次)")
             Thread.sleep(20)
         }
