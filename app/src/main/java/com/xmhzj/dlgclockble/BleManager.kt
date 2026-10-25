@@ -420,12 +420,18 @@ object BleManager {
 
                         val diff = (calcDevMinute * 60 + devSecond) - (sysMinute * 60 + sysSecond)
 
-                        val calBuf = ByteArray(3)
-                        calBuf[0] = 0x92.toByte()
-                        calBuf[1] = (diff and 0xFF).toByte()
-                        calBuf[2] = ((diff shr 8) and 0xFF).toByte()
-                        writeCharacteristic(longValueChar, calBuf)
-                        addLog("自动校准完成: 误差${diff}秒")
+                        // 偏差超过10分钟说明设备刚重启/未对时(显示默认时间)，是无效样本：
+                        // 正常漂移每天仅数秒。此时发0x92会污染固件校准值(旧固件甚至停走)，跳过只对时
+                        if (diff in -600..600) {
+                            val calBuf = ByteArray(3)
+                            calBuf[0] = 0x92.toByte()
+                            calBuf[1] = (diff and 0xFF).toByte()
+                            calBuf[2] = ((diff shr 8) and 0xFF).toByte()
+                            writeCharacteristic(longValueChar, calBuf)
+                            addLog("自动校准完成: 误差${diff}秒")
+                        } else {
+                            addLog("设备时间偏差${diff}秒(可能刚重启未对时)，跳过校准仅同步时间")
+                        }
                         Thread.sleep(500)
                     } finally {
                         suppressDeviceTimeLog = false
