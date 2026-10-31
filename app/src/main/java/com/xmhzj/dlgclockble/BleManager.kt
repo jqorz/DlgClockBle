@@ -45,6 +45,9 @@ enum class ConnectionState {
 // 扫描到的设备及其广播中的固件版本号(EPD_VERSION低16位，厂商AD数据携带，null=未解析到)
 data class ScannedDevice(val device: BluetoothDevice, val version: Int?)
 
+// 固件文件解析结果(版本号在镜像内魔数后偏移+8处，16位小端)
+data class FirmwareInfo(val version: Int, val size: Int, val crc: Int)
+
 @SuppressLint("MissingPermission")
 object BleManager {
     private const val TAG = "BleManager"
@@ -53,6 +56,12 @@ object BleManager {
     private const val CTRL_POINT_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
     private const val ADC1_VALUE_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
     private const val LONG_VALUE_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+
+    // 固件镜像内嵌的版本号定位魔数，版本号位于魔数偏移+8(16位小端)
+    private val FIRMWARE_MAGIC = byteArrayOf(
+        0x79.toByte(), 0x13.toByte(), 0xa5.toByte(), 0xf9.toByte(),
+        0x86.toByte(), 0xec.toByte(), 0x5a.toByte(), 0x06.toByte()
+    )
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var bluetoothAdapter: BluetoothAdapter? = null
@@ -123,10 +132,11 @@ object BleManager {
     private val _isSending90 = MutableStateFlow(false)
     val isSending90: StateFlow<Boolean> = _isSending90.asStateFlow()
 
-    private var lastSyncTimestamp: Long = 0
+    // 当前连接设备广播中的固件版本号(来自扫描列表)，null=未知
+    private val _deviceVersion = MutableStateFlow<Int?>(null)
+    val deviceVersion: StateFlow<Int?> = _deviceVersion.asStateFlow()
 
-    // 当前连接设备广播中的固件版本号(来自扫描列表)，用于决定OTA传输模式
-    @Volatile private var connectedFwVersion: Int? = null
+    private var lastSyncTimestamp: Long = 0
 
     fun init(appContext: Context) {
         context = appContext.applicationContext
@@ -189,7 +199,7 @@ object BleManager {
 
     fun connect(device: BluetoothDevice, fwVersion: Int? = null) {
         stopScan()
-        connectedFwVersion = fwVersion
+        _deviceVersion.value = fwVersion
         _connectionState.value = ConnectionState.CONNECTING
         _deviceName.value = device.name ?: device.address
         addLog("正在连接设备: ${_deviceName.value}${fwVersion?.let { " (固件 v$it)" } ?: ""}")
@@ -207,7 +217,7 @@ object BleManager {
         _connectionState.value = ConnectionState.DISCONNECTED
         _deviceName.value = ""
         _voltage.value = "--"
-        connectedFwVersion = null
+        _deviceVersion.value = null
         addLog("设备已断开连接")
     }
 
@@ -531,25 +541,18 @@ object BleManager {
 
         Thread {
             try {
-                val inputStream = context?.contentResolver?.openInputStream(uri) ?: throw Exception("无法打开文件")
-                val firmBuf = readAllBytes(inputStream)
-                inputStream.close()
+                val firmBuf = context?.contentResolver?.openInputStream(uri)
+                    ?.use { readAllBytes(it) } ?: throw Exception("无法打开文件")
 
                 val firmSize = firmBuf.size
                 addLog("固件大小: $firmSize")
 
-                val firmMagic = byteArrayOf(
-                    0x79.toByte(), 0x13.toByte(), 0xa5.toByte(), 0xf9.toByte(),
-                    0x86.toByte(), 0xec.toByte(), 0x5a.toByte(), 0x06.toByte()
-                )
-                val pos = findPattern(firmBuf, firmMagic)
-                if (pos == -1) {
+                val firmInfo = parseFirmwareInfo(firmBuf) ?: run {
                     addLog("无效固件: 未找到版本号!")
                     return@Thread
                 }
-
-                val firmVer = firmBuf[pos + 9] * 256 + firmBuf[pos + 8]
-                val firmCrc = crc32(firmBuf)
+                val firmVer = firmInfo.version
+                val firmCrc = firmInfo.crc
                 addLog("固件版本: $firmVer 大小: $firmSize CRC: ${Integer.toHexString(firmCrc)}")
 
                 // 镜像槽容量 = 0xC000(48KB) - 64B头 = 49088字节；超限说明选错了文件
@@ -655,6 +658,30 @@ object BleManager {
     }
 
     // --- Helpers ---
+
+    // --- 固件文件解析(升级前弹窗确认用) ---
+
+    // 读取并解析固件文件：返回版本号/大小/CRC，无法解析返回null
+    fun parseFirmwareInfo(uri: Uri): FirmwareInfo? {
+        return try {
+            val firmBuf = context?.contentResolver?.openInputStream(uri)
+                ?.use { readAllBytes(it) } ?: return null
+            parseFirmwareInfo(firmBuf)
+        } catch (e: Exception) {
+            Log.e(TAG, "读取固件文件失败: ${e.message}")
+            null
+        } catch (e: OutOfMemoryError) {
+            // 误选超大文件时readAllBytes可能OOM，按解析失败处理而不是崩溃
+            Log.e(TAG, "固件文件过大，读取失败")
+            null
+        }
+    }
+
+    private fun parseFirmwareInfo(firmBuf: ByteArray): FirmwareInfo? {
+        val pos = findPattern(firmBuf, FIRMWARE_MAGIC)
+        if (pos == -1) return null
+        return FirmwareInfo(firmBuf[pos + 9] * 256 + firmBuf[pos + 8], firmBuf.size, crc32(firmBuf))
+    }
 
     // 解析广播原始数据中的厂商AD(类型0xFF)。固件把EPD_VERSION低16位放在厂商数据前两字节(小端)
     private fun parseAdvVersion(record: android.bluetooth.le.ScanRecord?): Int? {

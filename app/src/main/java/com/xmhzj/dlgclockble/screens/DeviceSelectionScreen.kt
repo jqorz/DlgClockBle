@@ -25,6 +25,7 @@ import androidx.navigation.NavController
 import com.xmhzj.dlgclockble.BleManager
 import com.xmhzj.dlgclockble.ConnectionState
 import com.xmhzj.dlgclockble.ScannedDevice
+import kotlinx.coroutines.delay
 
 @SuppressLint("MissingPermission")
 @Composable
@@ -65,8 +66,19 @@ fun DeviceSelectionScreen(navController: NavController) {
         }
     }
 
+    // 从设备页返回时自动重新扫描(如升级完成后设备重启断开)，刷新列表里的版本号。
+    // 设备重启到恢复广播约需1~2秒，延迟后再扫，避免设备还没开始广播就扫完了
+    LaunchedEffect(Unit) {
+        val handle = navController.currentBackStackEntry?.savedStateHandle
+        if (handle?.get<Boolean>("auto_scan") == true) {
+            handle["auto_scan"] = false
+            delay(2000)
+            if (!BleManager.isScanning.value) BleManager.startScan()
+        }
+    }
+
     val filteredDevices = if (filterDlg) {
-        devices.filter { it.device.name?.startsWith("DLG") == true }
+        devices.filter { it.device.name?.startsWith("DCK") == true }
     } else {
         devices
     }
@@ -110,7 +122,7 @@ fun DeviceSelectionScreen(navController: NavController) {
                 checked = filterDlg,
                 onCheckedChange = { filterDlg = it }
             )
-            Text("只显示DLG设备")
+            Text("只显示DCK设备")
         }
 
         // 进度条

@@ -16,8 +16,8 @@ android {
         applicationId "com.xmhzj.dlgclockble"
         minSdk 26
         targetSdk 34
-        versionCode 2
-        versionName "1.1"
+        versionCode 3
+        versionName "1.2"
     }
     signingConfigs {
         debug {
@@ -41,6 +41,15 @@ android {
         }
         debug{
             minifyEnabled false
+        }
+    }
+
+    // release产物按 应用名_版本号 命名(应用名取自res/values/strings.xml的app_name)，如 价签时钟对时_1.1.apk
+    applicationVariants.all { variant ->
+        if (variant.buildType.name == 'release') {
+            variant.outputs.all { output ->
+                outputFileName = "app_release_${variant.versionName}.apk"
+            }
         }
     }
     compileOptions {

@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xmhzj.dlgclockble.BleManager
 import com.xmhzj.dlgclockble.ConnectionState
+import com.xmhzj.dlgclockble.FirmwareInfo
 
 @Composable
 fun MainScreen(onDisconnect: () -> Unit) {
@@ -32,12 +33,20 @@ fun MainScreen(onDisconnect: () -> Unit) {
     val isSyncing by BleManager.isSyncing.collectAsState()
     val isUpdating by BleManager.isUpdating.collectAsState()
     val isSending90 by BleManager.isSending90.collectAsState()
+    val deviceVersion by BleManager.deviceVersion.collectAsState()
     val functionsReady = connectionState == ConnectionState.SERVICE_READY
+
+    // 待确认的固件文件：选中后先解析弹窗显示版本号，用户确认后才开始发送
+    var pendingFirmwareUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingFirmwareInfo by remember { mutableStateOf<FirmwareInfo?>(null) }
 
     val firmwareLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
-        uri?.let { BleManager.sendFirmware(it) }
+        if (uri != null) {
+            pendingFirmwareInfo = BleManager.parseFirmwareInfo(uri)
+            pendingFirmwareUri = uri
+        }
     }
 
     // 断开连接时返回
@@ -140,6 +149,8 @@ fun MainScreen(onDisconnect: () -> Unit) {
                 ) {
                     InfoRow(label = "设备名称", value = deviceName)
                     Spacer(modifier = Modifier.height(8.dp))
+                    InfoRow(label = "固件版本", value = deviceVersion?.let { "v$it" } ?: "未知")
+                    Spacer(modifier = Modifier.height(8.dp))
                     InfoRow(label = "当前电压", value = voltage)
                     Spacer(modifier = Modifier.height(8.dp))
                     InfoRow(label = "系统时间", value = systemTime)
@@ -198,6 +209,19 @@ fun MainScreen(onDisconnect: () -> Unit) {
             }
         }
     }
+
+    // 固件升级确认弹窗：显示固件文件内的版本号，确认后才开始发送
+    pendingFirmwareUri?.let { uri ->
+        FirmwareConfirmDialog(
+            info = pendingFirmwareInfo,
+            currentVersion = deviceVersion,
+            onConfirm = {
+                pendingFirmwareUri = null
+                BleManager.sendFirmware(uri)
+            },
+            onCancel = { pendingFirmwareUri = null }
+        )
+    }
 }
 
 @Composable
@@ -233,4 +257,51 @@ private fun InfoRow(label: String, value: String) {
         Text(label, color = Color(0xFF6B7280), fontSize = 14.sp)
         Text(value, fontWeight = FontWeight.Medium, fontSize = 14.sp, color = Color(0xFF1F2937))
     }
+}
+
+@Composable
+private fun FirmwareConfirmDialog(
+    info: FirmwareInfo?,
+    currentVersion: Int?,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit
+) {
+    // 合法性检查与BleManager.sendFirmware一致：版本号可解析且大小在镜像槽容量内
+    val upgradable = info != null && info.size in 1024..49088
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("确认固件升级") },
+        text = {
+            Column {
+                InfoRow(label = "当前设备版本", value = currentVersion?.let { "v$it" } ?: "未知")
+                Spacer(modifier = Modifier.height(4.dp))
+                InfoRow(label = "固件文件版本", value = info?.let { "v${it.version}" } ?: "未识别")
+                Spacer(modifier = Modifier.height(4.dp))
+                InfoRow(label = "文件大小", value = info?.let { "${it.size} 字节" } ?: "--")
+                if (info != null && currentVersion != null && info.version <= currentVersion) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        "注意: 固件版本不高于当前版本",
+                        fontSize = 12.sp,
+                        color = Color(0xFFF59E0B)
+                    )
+                }
+                if (!upgradable) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = if (info == null) "未找到版本号标识，可能不是有效的固件文件"
+                        else "文件大小不合法(允许1024~49088字节)，请选择RAM运行版bin",
+                        fontSize = 12.sp,
+                        color = Color(0xFFEF4444)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm, enabled = upgradable) { Text("开始升级") }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel) { Text("取消") }
+        }
+    )
 }

@@ -39,7 +39,10 @@ class MainActivity : ComponentActivity() {
                     composable("main") {
                         MainScreen(
                             onDisconnect = {
-                                // 弹出当前页面，直接返回到设备选择页
+                                // 弹出当前页面，直接返回到设备选择页；置自动扫描标记，
+                                // 列表页回来后自动扫描(升级重启断开即可看到新版本号)
+                                navController.getBackStackEntry("device_selection")
+                                    .savedStateHandle["auto_scan"] = true
                                 navController.popBackStack()
                             }
                         )
