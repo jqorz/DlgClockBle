@@ -1,6 +1,7 @@
 package com.xmhzj.dlgclockble.screens
 
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -40,6 +41,16 @@ fun MainScreen(onDisconnect: () -> Unit) {
     var pendingFirmwareUri by remember { mutableStateOf<Uri?>(null) }
     var pendingFirmwareInfo by remember { mutableStateOf<FirmwareInfo?>(null) }
 
+    // 升级/同步中断开连接需先确认，避免误触把OTA打断
+    var showExitConfirm by remember { mutableStateOf(false) }
+    val requestExit = {
+        if (isUpdating || isSyncing) showExitConfirm = true else BleManager.disconnect()
+    }
+
+    // 返回键与✕按钮一致：断开连接，由DISCONNECTED回调走onDisconnect返回设备页。
+    // 不拦截的话back只弹页面而连接还在，设备选择页会因SERVICE_READY立刻把本页再压回来
+    BackHandler(onBack = requestExit)
+
     val firmwareLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -78,7 +89,7 @@ fun MainScreen(onDisconnect: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             // 关闭按钮
-            IconButton(onClick = { BleManager.disconnect() }) {
+            IconButton(onClick = requestExit) {
                 Text("✕", fontSize = 24.sp, color = Color(0xFFEF4444))
             }
             // 标题
@@ -220,6 +231,29 @@ fun MainScreen(onDisconnect: () -> Unit) {
                 BleManager.sendFirmware(uri)
             },
             onCancel = { pendingFirmwareUri = null }
+        )
+    }
+
+    // 断开确认弹窗(升级/同步进行中时)
+    if (showExitConfirm) {
+        AlertDialog(
+            onDismissRequest = { showExitConfirm = false },
+            title = { Text("断开连接") },
+            text = {
+                Text(
+                    if (isUpdating) "固件升级正在进行中，断开将中断升级。确定断开并返回吗？"
+                    else "时间同步正在进行中，断开将中断同步。确定断开并返回吗？"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showExitConfirm = false
+                    BleManager.disconnect()
+                }) { Text("断开") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showExitConfirm = false }) { Text("取消") }
+            }
         )
     }
 }

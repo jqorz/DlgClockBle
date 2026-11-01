@@ -56,6 +56,7 @@ object BleManager {
     private const val CTRL_POINT_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
     private const val ADC1_VALUE_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
     private const val LONG_VALUE_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+    private const val CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 
     // 固件镜像内嵌的版本号定位魔数，版本号位于魔数偏移+8(16位小端)
     private val FIRMWARE_MAGIC = byteArrayOf(
@@ -70,6 +71,13 @@ object BleManager {
     private var adc1ValueChar: BluetoothGattCharacteristic? = null
     private var longValueChar: BluetoothGattCharacteristic? = null
     private var scanCallback: ScanCallback? = null
+    // 扫描超时专用Runnable，stopScan只移除它；不能removeCallbacksAndMessages(null)，
+    // 那会把mainHandler上其他排队的操作(syncTime/校准的读写在post)一起清掉导致静默丢写
+    private val scanTimeoutRunnable = Runnable {
+        if (scanCallback != null) stopScan()
+    }
+    // CCCD使能进度：描述符写必须串行(背靠背写第二个会被GATT栈当busy拒绝)，见enableNextNotification
+    private var notifyIndex = 0
     private val gattLock = Any()
     private val deviceTimeLock = Any()
     @Volatile private var suppressDeviceTimeLog = false
@@ -149,11 +157,21 @@ object BleManager {
 
     // --- Scanning ---
 
-    fun startScan() {
-        val adapter = bluetoothAdapter ?: return
-        _scannedDevices.value = emptyList()
+    // 蓝牙开关是否打开(供UI在扫描前检查提示)
+    fun isBluetoothEnabled(): Boolean = bluetoothAdapter?.isEnabled == true
 
-        val scanner = adapter.bluetoothLeScanner ?: return
+    fun startScan() {
+        val adapter = bluetoothAdapter ?: run {
+            addLog("蓝牙适配器不可用")
+            return
+        }
+        val scanner = adapter.bluetoothLeScanner ?: run {
+            addLog("蓝牙未开启，无法扫描")
+            return
+        }
+        // 防重入：旧callback不停掉会泄漏，且旧的5s超时会提前杀掉新一轮扫描
+        if (_isScanning.value) stopScan()
+        _scannedDevices.value = emptyList()
         _isScanning.value = true
 
         scanCallback = object : ScanCallback() {
@@ -175,23 +193,32 @@ object BleManager {
         }
 
         val filters = listOf(ScanFilter.Builder().build())
-        scanner.startScan(
-            filters,
-            ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
-            scanCallback!!
-        )
+        try {
+            scanner.startScan(
+                filters,
+                ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
+                scanCallback!!
+            )
+        } catch (e: SecurityException) {
+            addLog("扫描失败: 缺少蓝牙权限 (${e.message})")
+            scanCallback = null
+            _isScanning.value = false
+            return
+        }
 
-        mainHandler.postDelayed({
-            if (scanCallback != null) stopScan()
-        }, 5000)
+        mainHandler.postDelayed(scanTimeoutRunnable, 5000)
     }
 
     fun stopScan() {
+        mainHandler.removeCallbacks(scanTimeoutRunnable)
         scanCallback?.let { callback ->
-            bluetoothAdapter?.bluetoothLeScanner?.stopScan(callback)
+            try {
+                bluetoothAdapter?.bluetoothLeScanner?.stopScan(callback)
+            } catch (_: SecurityException) {
+                // 无权限时stopScan也可能抛，忽略即可
+            }
             scanCallback = null
         }
-        mainHandler.removeCallbacksAndMessages(null)
         _isScanning.value = false
     }
 
@@ -199,6 +226,13 @@ object BleManager {
 
     fun connect(device: BluetoothDevice, fwVersion: Int? = null) {
         stopScan()
+        // 上一次的gatt若还挂着(异常路径没走到disconnect)，先释放再连新的
+        synchronized(gattLock) {
+            bluetoothGatt?.close()
+            bluetoothGatt = null
+        }
+        notifyIndex = 0
+        otaDelivered = false
         _deviceVersion.value = fwVersion
         _connectionState.value = ConnectionState.CONNECTING
         _deviceName.value = device.name ?: device.address
@@ -247,46 +281,35 @@ object BleManager {
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                val service = gatt.getService(UUID.fromString(SERVICE_UUID))
-                if (service != null) {
-                    ctrlPointChar = service.getCharacteristic(UUID.fromString(CTRL_POINT_UUID))
-                    adc1ValueChar = service.getCharacteristic(UUID.fromString(ADC1_VALUE_UUID))
-                    longValueChar = service.getCharacteristic(UUID.fromString(LONG_VALUE_UUID))
-
-                    if (adc1ValueChar != null) {
-                        gatt.setCharacteristicNotification(adc1ValueChar, true)
-                        val descriptor = adc1ValueChar!!.getDescriptor(
-                            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-                        )
-                        if (descriptor != null) {
-                            descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                            gatt.writeDescriptor(descriptor)
-                        }
-                        gatt.readCharacteristic(adc1ValueChar)
-                    }
-
-                    if (longValueChar != null) {
-                        // 写类型由writeCharacteristic按参数统一设置(WRITE_TYPE_DEFAULT)，
-                        // 设备端仅开通有响应写权限，不能预设NO_RESPONSE(无Write Response回调)
-                        gatt.setCharacteristicNotification(longValueChar, true)
-                        val longDescriptor = longValueChar!!.getDescriptor(
-                            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-                        )
-                        if (longDescriptor != null) {
-                            longDescriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                            gatt.writeDescriptor(longDescriptor)
-                        }
-                        gatt.readCharacteristic(longValueChar)
-                    }
-
-                    addLog("服务已就绪")
-                    _connectionState.value = ConnectionState.SERVICE_READY
-                } else {
-                    addLog("错误: 找不到服务UUID")
-                    disconnect()
-                }
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // 不处理的话会永远停在CONNECTING(界面转圈弹窗卡死)，必须落到断开让UI恢复
+                addLog("服务发现失败: status=0x${status.toString(16)}")
+                disconnect()
+                return
             }
+            val service = gatt.getService(UUID.fromString(SERVICE_UUID))
+            if (service == null) {
+                addLog("错误: 找不到服务UUID")
+                disconnect()
+                return
+            }
+            ctrlPointChar = service.getCharacteristic(UUID.fromString(CTRL_POINT_UUID))
+            adc1ValueChar = service.getCharacteristic(UUID.fromString(ADC1_VALUE_UUID))
+            longValueChar = service.getCharacteristic(UUID.fromString(LONG_VALUE_UUID))
+            notifyIndex = 0
+            enableNextNotification(gatt)
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt?,
+            descriptor: BluetoothGattDescriptor?,
+            status: Int
+        ) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                addLog("descriptor写入失败: 0x${status.toString(16)}")
+            }
+            // CCCD逐个写：一个写完回调到达后再写下一个
+            if (gatt != null) enableNextNotification(gatt)
         }
 
         override fun onCharacteristicRead(
@@ -349,16 +372,33 @@ object BleManager {
                 addLog("写入失败: uuid=$uuid status=0x${status.toString(16)}")
             }
         }
+    }
 
-        override fun onDescriptorWrite(
-            gatt: BluetoothGatt?,
-            descriptor: BluetoothGattDescriptor?,
-            status: Int
-        ) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                addLog("descriptor写入失败: $status")
+    // 使能通知(写CCCD)必须逐个串行：背靠背两个writeDescriptor在多数GATT栈上第二个
+    // 会因busy被拒，通知静默不生效。每写完一个在onDescriptorWrite回调里继续下一个，
+    // 全部写完做初始读(电压/设备时间)并置SERVICE_READY
+    private fun enableNextNotification(gatt: BluetoothGatt) {
+        val chars = listOfNotNull(adc1ValueChar, longValueChar)
+        while (notifyIndex < chars.size) {
+            val c = chars[notifyIndex]
+            notifyIndex++
+            gatt.setCharacteristicNotification(c, true)
+            val descriptor = c.getDescriptor(UUID.fromString(CCCD_UUID))
+            if (descriptor != null) {
+                @Suppress("DEPRECATION")
+                descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                if (gatt.writeDescriptor(descriptor)) {
+                    return  // 等onDescriptorWrite回调继续
+                }
+                addLog("写CCCD被拒(busy?)，继续: ${c.uuid}")
             }
         }
+        // 写类型由writeCharacteristic按参数统一设置(WRITE_TYPE_DEFAULT)，
+        // 设备端仅开通有响应写权限，不能预设NO_RESPONSE(无Write Response回调)
+        adc1ValueChar?.let { gatt.readCharacteristic(it) }
+        longValueChar?.let { gatt.readCharacteristic(it) }
+        addLog("服务已就绪")
+        _connectionState.value = ConnectionState.SERVICE_READY
     }
 
     // --- System time ---
@@ -612,6 +652,11 @@ object BleManager {
                     Thread.sleep(30)
                 }
 
+                // 全部固件数据已送达并确认。在此置"OTA完成"标记而不是等0xa4发完：
+                // 新固件写完最后一页会立即重启断链，若断开回调先到、标记还没置上，
+                // 列表页就不会自动重扫了。此后无论哪种方式断开都算升级后断开
+                otaDelivered = true
+
                 // 0xa4=升级结束(旧固件靠它复位；新固件写完最后一页会自行断开重启，
                 // 此时0xa4撞上断链属正常，不能当失败)
                 buf[0] = 0xa4.toByte()
@@ -679,7 +724,9 @@ object BleManager {
 
     private fun parseFirmwareInfo(firmBuf: ByteArray): FirmwareInfo? {
         val pos = findPattern(firmBuf, FIRMWARE_MAGIC)
-        if (pos == -1) return null
+        // 版本号16位取魔数偏移+8..+9；魔数恰好在文件末尾时取不到，视为无效
+        // (不判越界，截断文件在这里会直接IndexOutOfBoundsException崩溃)
+        if (pos == -1 || pos + 10 > firmBuf.size) return null
         return FirmwareInfo(firmBuf[pos + 9] * 256 + firmBuf[pos + 8], firmBuf.size, crc32(firmBuf))
     }
 
@@ -735,6 +782,17 @@ object BleManager {
     // 待确认写操作桥接：OTA线程提交写后在onCharacteristicWrite收到Write Response时释放
     @Volatile private var pendingWriteAck: CountDownLatch? = null
     @Volatile private var pendingWriteOk = false
+
+    // OTA固件数据是否已全部送达(最后一页Write Response已确认)。
+    // 断开返回列表页时消费该标记，决定是否自动重扫刷新版本号；普通断开不重扫
+    @Volatile private var otaDelivered = false
+
+    // 读取并清除"OTA数据已全部送达"标记
+    fun consumeOtaDelivered(): Boolean {
+        val delivered = otaDelivered
+        otaDelivered = false
+        return delivered
+    }
 
     // 带重试的写入：提交后等待设备回Write Response才发下一包。
     // 只依赖writeCharacteristic的返回值(仅表示已入队)会在栈内队列积压时静默丢包——
